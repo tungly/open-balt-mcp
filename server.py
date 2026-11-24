@@ -275,6 +275,8 @@ NEAR_DEFAULT_RADIUS_M = 250
 NEAR_MAX_RADIUS_M = 2000
 NEAR_DEFAULT_LIMIT = 25
 NEAR_MAX_LIMIT = 200
+# The service's maxRecordCount; the most one request can return.
+NEAR_SERVICE_MAX_RECORDS = 2000
 # Generous box around Baltimore City. A point outside it is almost certainly a
 # wrong or invented coordinate, so it is rejected instead of returning "no permits".
 BALTIMORE_BBOX = {"min_lat": 39.15, "max_lat": 39.42, "min_lon": -76.76, "max_lon": -76.48}
@@ -315,6 +317,39 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dp, dl = p2 - p1, math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+async def _query_near(spatial: dict, limit: int) -> list:
+    """Fetch the first `limit` permits of a distance query, in the service's order.
+
+    On baltegis a distance query returns fewer features than resultRecordCount
+    (about 80%) while flagging more, and resultOffset paging is inconsistent with
+    the distance filter: the next page repeats records from the first. So never
+    page by offset here. Re-ask from offset 0 with a larger record count instead;
+    the first page of an ordered query is the true top of the order.
+    """
+    record_count = min(NEAR_SERVICE_MAX_RECORDS, max(limit * 2, 50))
+    while True:
+        data = await query_permit_api(where_clause="1=1", max_records=record_count, extra_params=spatial)
+        features = data.get("features") or []
+        if (
+            len(features) >= limit
+            or not _exceeded_transfer_limit(data)
+            or record_count >= NEAR_SERVICE_MAX_RECORDS
+        ):
+            break
+        record_count = NEAR_SERVICE_MAX_RECORDS
+
+    # Defensive: drop any repeated feature so a service quirk cannot inflate counts.
+    seen, unique = set(), []
+    for feat in features:
+        props = feat.get("properties") or {}
+        key = props.get("OBJECTID", feat.get("id")) or props.get("CaseNumber")
+        if key is not None and key in seen:
+            continue
+        seen.add(key)
+        unique.append(feat)
+    return unique[:limit]
 
 
 def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
@@ -587,10 +622,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             "units": "esriSRUnit_Meter",
             "outSR": 4326,
             # Sorted by the service, so "most recent" is exact, not a sort of an arbitrary subset.
-            "orderByFields": "IssuedDate DESC",
+            "orderByFields": "IssuedDate DESC, OBJECTID DESC",
         }
-        data = await query_permit_api_paginated(where_clause="1=1", max_records=limit, extra_params=spatial)
-        features = data.get("features") or []
+        features = await _query_near(spatial, limit)
 
         permits = []
         for feat in features:
@@ -648,21 +682,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
         where = f"IssuedDate >= TIMESTAMP '{cutoff_date:%Y-%m-%d %H:%M:%S}'"
 
-        # Get more records to sort properly (fetch 2x the limit, then sort)
-        data = await query_permit_api_paginated(where_clause=where, max_records=limit * 2)
+        # Sort on the service so these are the most recent permits, not a sort of
+        # an arbitrary subset. OBJECTID breaks ties so offset paging is stable.
+        data = await query_permit_api_paginated(
+            where_clause=where,
+            max_records=limit,
+            extra_params={"orderByFields": "IssuedDate DESC, OBJECTID DESC"},
+        )
+        features = data.get("features") or []
 
-        if not data.get("features"):
+        if not features:
             return [TextContent(
                 type="text",
                 text=f"No permits found in the last {days} days"
             )]
-
-        # Sort by IssuedDate descending and take the limit
-        features = sorted(
-            data["features"],
-            key=lambda x: x.get("properties", {}).get("IssuedDate", 0),
-            reverse=True
-        )[:limit]
 
         results = [format_permit(feat) for feat in features]
         result_text = f"Found {len(results)} recent permit(s) (last {days} days):\n\n" + "\n".join(results)
