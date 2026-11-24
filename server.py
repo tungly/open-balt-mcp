@@ -83,6 +83,18 @@ async def query_permit_api(
     return data
 
 
+def _exceeded_transfer_limit(data: dict) -> bool:
+    """Whether ArcGIS says more records exist beyond this page.
+
+    With f=geojson, ArcGIS Enterprise (baltegis) sets the flag at the top level and
+    under "properties", but ArcGIS Online sets it only under "properties". Reading the
+    top level alone silently truncated ArcGIS Online results at one page.
+    """
+    if data.get("exceededTransferLimit"):
+        return True
+    return bool((data.get("properties") or {}).get("exceededTransferLimit"))
+
+
 async def query_permit_api_paginated(
     where_clause: str = "1=1",
     out_fields: str = "*",
@@ -127,12 +139,9 @@ async def query_permit_api_paginated(
 
         all_features.extend(features)
 
-        # Check if we got fewer results than requested (end of data)
-        if len(features) < batch_size:
-            break
-
-        # Check if API indicates no more data
-        if not data.get("exceededTransferLimit", False):
+        # The server's "more results" flag is authoritative. A short page with the
+        # flag set means the server's page size is smaller than ours, not end of data.
+        if not _exceeded_transfer_limit(data):
             break
 
         offset += len(features)
