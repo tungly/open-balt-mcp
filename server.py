@@ -274,7 +274,23 @@ NEAR_MAX_LIMIT = 200
 NEAR_SERVICE_MAX_RECORDS = 2000
 # Generous box around Baltimore City. A point outside it is almost certainly a
 # wrong or invented coordinate, so it is rejected instead of returning "no permits".
-BALTIMORE_BBOX = {"min_lat": 39.15, "max_lat": 39.42, "min_lon": -76.76, "max_lon": -76.48}
+# Fast first check: the extent of all permits (the city limits) padded by about
+# 2.5 km, which is more than the largest search radius.
+BALTIMORE_BBOX = {"min_lat": 39.175, "max_lat": 39.397, "min_lon": -76.737, "max_lon": -76.504}
+# Exact check: the city's council districts together cover the whole city.
+CITY_BOUNDARY_LAYER = os.environ.get(
+    "BALTIMORE_BOUNDARY_LAYER",
+    "https://baltegis.baltimorecity.gov/mapping/rest/services/Planning/Boundaries/MapServer/4/query",
+)
+# A point may sit just outside the city (in the harbor, say) as long as the search
+# circle still reaches city land; below this radius, allow this much slack anyway.
+CITY_BOUNDARY_MIN_TOLERANCE_M = 100
+
+# Bounds for the limit argument of the original search tools.
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 2000
+DEFAULT_DAYS = 30
+MAX_DAYS = 3650
 
 NEAR_OUTPUT_SCHEMA = {
     "type": "object",
@@ -347,12 +363,62 @@ async def _query_near(spatial: dict, limit: int) -> list:
     return unique[:limit]
 
 
-def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
+def _int_arg(arguments: dict, name: str, default: int, lo: int, hi: int) -> int:
+    """Read an integer argument, raising (a tool error) if it is out of range.
+
+    The SDK already checks inputSchema's minimum/maximum; this keeps the bounds
+    enforced even if input validation is turned off, and never clamps silently.
+    """
+    value = arguments.get(name)
+    if value is None:
         return default
-    return max(lo, min(hi, n))
+    # JSON Schema counts 5.0 as an integer, so accept integral floats too.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer between {lo} and {hi}")
+    if not lo <= value <= hi:
+        raise ValueError(f"{name} must be between {lo} and {hi} (got {value})")
+    return value
+
+
+def _limit_schema(default: int = DEFAULT_LIMIT, hi: int = MAX_LIMIT) -> dict:
+    return {
+        "type": "integer",
+        "description": f"Maximum number of results to return (default {default}, max {hi})",
+        "default": default,
+        "minimum": 1,
+        "maximum": hi,
+    }
+
+
+async def _point_reaches_city(lat: float, lon: float, radius_m: int) -> Optional[bool]:
+    """Whether a circle around the point touches Baltimore City, or None if unknown.
+
+    None means the boundary service could not answer; the caller then relies on
+    the bounding-box check alone rather than failing the search.
+    """
+    params = {
+        "where": "1=1",
+        "geometry": f"{lon},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": max(radius_m, CITY_BOUNDARY_MIN_TOLERANCE_M),
+        "units": "esriSRUnit_Meter",
+        "returnCountOnly": "true",
+        "f": "json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(CITY_BOUNDARY_LAYER, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("count"), int):
+        return None
+    return data["count"] > 0
 
 
 @app.list_tools()
@@ -369,11 +435,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Address or part of address to search for (e.g., '100 Main St' or 'Main')"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 50)",
-                        "default": 50
-                    }
+                    "limit": _limit_schema()
                 },
                 "required": ["address"]
             }
@@ -392,11 +454,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "End date in YYYY-MM-DD format (e.g., '2024-12-31')"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 50)",
-                        "default": 50
-                    }
+                    "limit": _limit_schema()
                 },
                 "required": ["start_date", "end_date"]
             }
@@ -411,11 +469,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Neighborhood name (e.g., 'Fells Point', 'Canton')"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 50)",
-                        "default": 50
-                    }
+                    "limit": _limit_schema()
                 },
                 "required": ["neighborhood"]
             },
@@ -437,12 +491,16 @@ async def list_tools() -> list[Tool]:
                     "radius_m": {
                         "type": "integer",
                         "description": f"Search radius in meters (default {NEAR_DEFAULT_RADIUS_M}, max {NEAR_MAX_RADIUS_M})",
-                        "default": NEAR_DEFAULT_RADIUS_M
+                        "default": NEAR_DEFAULT_RADIUS_M,
+                        "minimum": 1,
+                        "maximum": NEAR_MAX_RADIUS_M
                     },
                     "limit": {
                         "type": "integer",
                         "description": f"Maximum number of results (default {NEAR_DEFAULT_LIMIT}, max {NEAR_MAX_LIMIT})",
-                        "default": NEAR_DEFAULT_LIMIT
+                        "default": NEAR_DEFAULT_LIMIT,
+                        "minimum": 1,
+                        "maximum": NEAR_MAX_LIMIT
                     }
                 },
                 "required": ["lat", "lon"]
@@ -469,15 +527,13 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 50)",
-                        "default": 50
-                    },
+                    "limit": _limit_schema(),
                     "days": {
                         "type": "integer",
-                        "description": "Number of days to look back (default: 30)",
-                        "default": 30
+                        "description": f"Number of days to look back (default {DEFAULT_DAYS}, max {MAX_DAYS})",
+                        "default": DEFAULT_DAYS,
+                        "minimum": 1,
+                        "maximum": MAX_DAYS
                     }
                 }
             }
@@ -505,7 +561,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     
     if name == "search_permits_by_address":
         address = arguments.get("address", "")
-        limit = arguments.get("limit", 50)
+        limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         # Build WHERE clause - handle partial matches
         escaped_address = address.replace("'", "''") if address else ""
@@ -528,7 +584,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     elif name == "search_permits_by_date_range":
         start_date = arguments.get("start_date", "")
         end_date = arguments.get("end_date", "")
-        limit = arguments.get("limit", 50)
+        limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         # Validate dates; strptime also guarantees only digits reach the query.
         try:
@@ -563,7 +619,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
     elif name == "search_permits_by_neighborhood":
         neighborhood = arguments.get("neighborhood", "")
-        limit = arguments.get("limit", 50)
+        limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         escaped_neighborhood = neighborhood.replace("'", "''")
         where = f"Neighborhood LIKE '%{escaped_neighborhood}%'"
@@ -597,16 +653,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         except (KeyError, TypeError, ValueError):
             raise ValueError("lat and lon are required numbers (WGS84 decimal degrees)")
 
+        radius_m = _int_arg(arguments, "radius_m", NEAR_DEFAULT_RADIUS_M, 1, NEAR_MAX_RADIUS_M)
+        limit = _int_arg(arguments, "limit", NEAR_DEFAULT_LIMIT, 1, NEAR_MAX_LIMIT)
+
+        # Raised, so the client sees a tool error rather than "no permits here".
+        outside = ValueError(
+            f"({lat}, {lon}) is outside Baltimore City (no city land within {radius_m} m). "
+            "Check the coordinates; latitude should be about 39.20-39.37 and "
+            "longitude about -76.71 to -76.53."
+        )
         b = BALTIMORE_BBOX
         if not (b["min_lat"] <= lat <= b["max_lat"] and b["min_lon"] <= lon <= b["max_lon"]):
-            # Raised, so the client sees a tool error rather than an empty result.
-            raise ValueError(
-                f"({lat}, {lon}) is outside Baltimore City. Check the coordinates; "
-                "latitude should be about 39.2-39.4 and longitude about -76.7 to -76.5."
-            )
-
-        radius_m = _clamp_int(arguments.get("radius_m"), NEAR_DEFAULT_RADIUS_M, 1, NEAR_MAX_RADIUS_M)
-        limit = _clamp_int(arguments.get("limit"), NEAR_DEFAULT_LIMIT, 1, NEAR_MAX_LIMIT)
+            raise outside
+        # The box is a rectangle and catches county suburbs; check the real city limits.
+        # If the boundary service is unavailable, go on with the box check alone.
+        if await _point_reaches_city(lat, lon, radius_m) is False:
+            raise outside
 
         spatial = {
             "geometry": f"{lon},{lat}",
@@ -669,12 +731,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return [TextContent(type="text", text=f"Permit details:\n\n{result}")]
     
     elif name == "get_recent_permits":
-        limit = arguments.get("limit", 50)
-        days = arguments.get("days", 30)
+        limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+        days = _int_arg(arguments, "days", DEFAULT_DAYS, 1, MAX_DAYS)
 
         # Calculate date threshold
         # "Today" in Baltimore; the service reads TIMESTAMP literals as America/New_York.
-        cutoff_date = datetime.now(CITY_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=int(days))
+        cutoff_date = datetime.now(CITY_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
 
         where = f"IssuedDate >= TIMESTAMP '{cutoff_date:%Y-%m-%d %H:%M:%S}'"
 
