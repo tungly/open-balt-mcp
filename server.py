@@ -122,8 +122,8 @@ async def query_permit_api_paginated(
 
 def format_permit(permit: dict) -> str:
     """Format a permit feature into a readable string."""
-    props = permit.get("properties", {})
-    geom = permit.get("geometry", {})
+    props = permit.get("properties") or {}
+    geom = permit.get("geometry") or {}  # GeoJSON allows "geometry": null
     
     # Format dates
     issued_date = ""
@@ -167,6 +167,73 @@ def format_permit(permit: dict) -> str:
     Modification: {'Yes' if props.get('IsPermitModification') else 'No'}
 ---"""
 
+
+def _ms_to_date(value: Any) -> Optional[str]:
+    """Convert an ArcGIS epoch-milliseconds timestamp to YYYY-MM-DD, or None."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000).strftime("%Y-%m-%d")
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def to_record(permit: dict) -> dict:
+    """Convert a permit feature into a typed record matching PERMIT_RECORD_SCHEMA."""
+    props = permit.get("properties") or {}
+    coords = (permit.get("geometry") or {}).get("coordinates") or [None, None]
+    lon, lat = (coords + [None, None])[:2]
+    cost = props.get("Cost")
+    return {
+        "case_number": props.get("CaseNumber") or "",
+        "address": props.get("Address") or "",
+        "neighborhood": props.get("Neighborhood"),
+        "issued_date": _ms_to_date(props.get("IssuedDate")),
+        "expiration_date": _ms_to_date(props.get("ExpirationDate")),
+        "cost": float(cost) if isinstance(cost, (int, float)) else None,
+        "description": props.get("Description"),
+        "block_lot": props.get("BLOCKLOT"),
+        "council_district": props.get("Council_District"),
+        "existing_use": props.get("ExistingUse"),
+        "proposed_use": props.get("ProposedUse"),
+        "is_modification": bool(props.get("IsPermitModification")),
+        "lat": lat if isinstance(lat, (int, float)) else None,
+        "lon": lon if isinstance(lon, (int, float)) else None,
+    }
+
+
+_nullable_string = {"type": ["string", "null"]}
+
+PERMIT_RECORD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "case_number": {"type": "string"},
+        "address": {"type": "string"},
+        "neighborhood": _nullable_string,
+        "issued_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+        "expiration_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+        "cost": {"type": ["number", "null"]},
+        "description": _nullable_string,
+        "block_lot": _nullable_string,
+        "council_district": {"type": ["string", "integer", "null"]},
+        "existing_use": _nullable_string,
+        "proposed_use": _nullable_string,
+        "is_modification": {"type": "boolean"},
+        "lat": {"type": ["number", "null"]},
+        "lon": {"type": ["number", "null"]},
+    },
+    "required": ["case_number", "address"],
+}
+
+PERMIT_LIST_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "The search term the tool was called with"},
+        "total": {"type": "integer", "description": "Number of permits returned"},
+        "permits": {"type": "array", "items": PERMIT_RECORD_SCHEMA},
+    },
+    "required": ["query", "total", "permits"],
+}
 
 
 @app.list_tools()
@@ -232,7 +299,8 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["neighborhood"]
-            }
+            },
+            outputSchema=PERMIT_LIST_OUTPUT_SCHEMA
         ),
         Tool(
             name="search_permits_by_case_number",
@@ -349,18 +417,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         where = f"Neighborhood LIKE '%{escaped_neighborhood}%'"
 
         data = await query_permit_api_paginated(where_clause=where, max_records=limit)
-        
-        if not data.get("features"):
-            return [TextContent(
-                type="text",
-                text=f"No permits found in neighborhood: {neighborhood}"
-            )]
-        
-        results = [format_permit(feat) for feat in data["features"]]
-        total = data.get("totalRetrieved", len(results))
-        result_text = f"Found {total} permit(s) in '{neighborhood}':\n\n" + "\n".join(results)
+        features = data.get("features") or []
 
-        return [TextContent(type="text", text=result_text)]
+        # outputSchema is declared for this tool, so every path returns
+        # (text for the model, structured data validated against the schema).
+        structured = {
+            "query": neighborhood,
+            "total": len(features),
+            "permits": [to_record(feat) for feat in features],
+        }
+
+        if not features:
+            return (
+                [TextContent(type="text", text=f"No permits found in neighborhood: {neighborhood}")],
+                structured,
+            )
+
+        results = [format_permit(feat) for feat in features]
+        result_text = f"Found {len(features)} permit(s) in '{neighborhood}':\n\n" + "\n".join(results)
+
+        return [TextContent(type="text", text=result_text)], structured
     
     elif name == "search_permits_by_case_number":
         case_number = arguments.get("case_number", "")
