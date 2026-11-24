@@ -6,6 +6,7 @@ Connects to data.baltimorecity.gov to query building permits
 
 import asyncio
 import json
+import math
 import os
 from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
@@ -37,15 +38,21 @@ async def query_permit_api(
     out_fields: str = "*",
     result_offset: Optional[int] = None,
     max_records: Optional[int] = None,
-    return_count_only: bool = False
+    return_count_only: bool = False,
+    extra_params: Optional[dict] = None
 ) -> dict:
-    """Query the Baltimore permit API with given parameters."""
+    """Query the Baltimore permit API with given parameters.
+
+    extra_params is merged into the ArcGIS query (e.g. spatial filter, orderByFields).
+    """
     params = {
         "where": where_clause,
         "outFields": out_fields,
         "f": "geojson",
         "returnGeometry": "true"
     }
+    if extra_params:
+        params.update(extra_params)
 
     if result_offset is not None:
         params["resultOffset"] = result_offset
@@ -80,7 +87,8 @@ async def query_permit_api_paginated(
     where_clause: str = "1=1",
     out_fields: str = "*",
     max_records: Optional[int] = None,
-    page_size: int = 1000
+    page_size: int = 1000,
+    extra_params: Optional[dict] = None
 ) -> dict:
     """
     Query the Baltimore permit API with automatic pagination.
@@ -108,7 +116,8 @@ async def query_permit_api_paginated(
             where_clause=where_clause,
             out_fields=out_fields,
             result_offset=offset,
-            max_records=batch_size
+            max_records=batch_size,
+            extra_params=extra_params
         )
 
         features = data.get("features", [])
@@ -250,6 +259,62 @@ PERMIT_LIST_OUTPUT_SCHEMA = {
     "required": ["query", "total", "permits"],
 }
 
+# --- Spatial search -------------------------------------------------------
+# Server-side guardrails: the model supplies a point and radius, never raw
+# geometry, and both the radius and result count are capped here.
+NEAR_DEFAULT_RADIUS_M = 250
+NEAR_MAX_RADIUS_M = 2000
+NEAR_DEFAULT_LIMIT = 25
+NEAR_MAX_LIMIT = 200
+# Generous box around Baltimore City. A point outside it is almost certainly a
+# wrong or invented coordinate, so it is rejected instead of returning "no permits".
+BALTIMORE_BBOX = {"min_lat": 39.15, "max_lat": 39.42, "min_lon": -76.76, "max_lon": -76.48}
+
+NEAR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Center point and radius searched"},
+        "center": {
+            "type": "object",
+            "properties": {"lat": {"type": "number"}, "lon": {"type": "number"}},
+            "required": ["lat", "lon"],
+        },
+        "radius_m": {"type": "number"},
+        "total": {"type": "integer", "description": "Number of permits returned"},
+        "permits": {
+            "type": "array",
+            "items": {
+                **PERMIT_RECORD_SCHEMA,
+                "properties": {
+                    **PERMIT_RECORD_SCHEMA["properties"],
+                    "distance_m": {
+                        "type": ["number", "null"],
+                        "description": "Straight-line distance from the center point, in meters",
+                    },
+                },
+            },
+        },
+    },
+    "required": ["query", "center", "radius_m", "total", "permits"],
+}
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two WGS84 points, in meters."""
+    r = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
@@ -316,6 +381,34 @@ async def list_tools() -> list[Tool]:
                 "required": ["neighborhood"]
             },
             outputSchema=PERMIT_LIST_OUTPUT_SCHEMA
+        ),
+        Tool(
+            name="search_permits_near",
+            description=(
+                "Find permits within a radius of a point in Baltimore City, most recently "
+                "issued first, with each permit's distance from the point. Use coordinates "
+                "from a geocoded address or from another permit's lat/lon; do not guess them. "
+                f"Radius is capped at {NEAR_MAX_RADIUS_M} m and results at {NEAR_MAX_LIMIT}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Latitude (WGS84), e.g. 39.2833"},
+                    "lon": {"type": "number", "description": "Longitude (WGS84), e.g. -76.5783"},
+                    "radius_m": {
+                        "type": "integer",
+                        "description": f"Search radius in meters (default {NEAR_DEFAULT_RADIUS_M}, max {NEAR_MAX_RADIUS_M})",
+                        "default": NEAR_DEFAULT_RADIUS_M
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"Maximum number of results (default {NEAR_DEFAULT_LIMIT}, max {NEAR_MAX_LIMIT})",
+                        "default": NEAR_DEFAULT_LIMIT
+                    }
+                },
+                "required": ["lat", "lon"]
+            },
+            outputSchema=NEAR_OUTPUT_SCHEMA
         ),
         Tool(
             name="search_permits_by_case_number",
@@ -457,7 +550,69 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         result_text = f"Found {len(features)} permit(s) in '{neighborhood}':\n\n" + "\n".join(results)
 
         return [TextContent(type="text", text=result_text)], structured
-    
+
+    elif name == "search_permits_near":
+        try:
+            lat = float(arguments["lat"])
+            lon = float(arguments["lon"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("lat and lon are required numbers (WGS84 decimal degrees)")
+
+        b = BALTIMORE_BBOX
+        if not (b["min_lat"] <= lat <= b["max_lat"] and b["min_lon"] <= lon <= b["max_lon"]):
+            # Raised, so the client sees a tool error rather than an empty result.
+            raise ValueError(
+                f"({lat}, {lon}) is outside Baltimore City. Check the coordinates; "
+                "latitude should be about 39.2-39.4 and longitude about -76.7 to -76.5."
+            )
+
+        radius_m = _clamp_int(arguments.get("radius_m"), NEAR_DEFAULT_RADIUS_M, 1, NEAR_MAX_RADIUS_M)
+        limit = _clamp_int(arguments.get("limit"), NEAR_DEFAULT_LIMIT, 1, NEAR_MAX_LIMIT)
+
+        spatial = {
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "distance": radius_m,
+            "units": "esriSRUnit_Meter",
+            "outSR": 4326,
+            # Sorted by the service, so "most recent" is exact, not a sort of an arbitrary subset.
+            "orderByFields": "IssuedDate DESC",
+        }
+        data = await query_permit_api_paginated(where_clause="1=1", max_records=limit, extra_params=spatial)
+        features = data.get("features") or []
+
+        permits = []
+        for feat in features:
+            rec = to_record(feat)
+            rec["distance_m"] = (
+                round(_haversine_m(lat, lon, rec["lat"], rec["lon"]), 1)
+                if rec["lat"] is not None and rec["lon"] is not None else None
+            )
+            permits.append(rec)
+
+        query_desc = f"within {radius_m} m of ({lat}, {lon})"
+        structured = {
+            "query": query_desc,
+            "center": {"lat": lat, "lon": lon},
+            "radius_m": radius_m,
+            "total": len(permits),
+            "permits": permits,
+        }
+
+        if not features:
+            return [TextContent(type="text", text=f"No permits found {query_desc}")], structured
+
+        blocks = []
+        for feat, rec in zip(features, permits):
+            dist = f"{rec['distance_m']:.0f} m away" if rec["distance_m"] is not None else "distance unknown"
+            blocks.append(f"    Distance: {dist}" + format_permit(feat))
+        capped = " (result limit reached; narrow the radius for more complete results)" if len(permits) >= limit else ""
+        result_text = f"Found {len(permits)} permit(s) {query_desc}, most recent first{capped}:\n\n" + "\n".join(blocks)
+
+        return [TextContent(type="text", text=result_text)], structured
+
     elif name == "search_permits_by_case_number":
         case_number = arguments.get("case_number", "")
         

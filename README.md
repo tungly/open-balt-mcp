@@ -12,6 +12,7 @@ This MCP server provides tools to query Baltimore's building permit database:
 - **Search by Case Number**: Look up a specific permit by its case number
 - **Recent Permits**: Get the most recently issued permits
 - **Count Permits**: Count permits matching specific criteria
+- **Search Near a Point**: Find permits within a radius of a lat/lon, most recent first, with distances
 
 ## Installation
 
@@ -123,6 +124,30 @@ Search for permits in a specific neighborhood.
 {
   "neighborhood": "Fells Point",
   "limit": 50
+}
+```
+
+Returns readable text plus structured content (`{query, total, permits[]}`) validated against the tool's `outputSchema`.
+
+### `search_permits_near`
+
+Find permits within a radius of a point, most recently issued first. Each result includes `distance_m` from the point. Returns readable text plus structured content validated against the tool's `outputSchema`.
+
+**Parameters:**
+- `lat` (required): Latitude, WGS84 decimal degrees (e.g., 39.2763)
+- `lon` (required): Longitude, WGS84 decimal degrees (e.g., -76.5688)
+- `radius_m` (optional): Search radius in meters (default: 250, max: 2000)
+- `limit` (optional): Maximum results to return (default: 25, max: 200)
+
+Points outside Baltimore City return an error rather than an empty result, so a wrong coordinate is not mistaken for "no permits here."
+
+**Example:**
+```json
+{
+  "lat": 39.2763,
+  "lon": -76.5688,
+  "radius_m": 150,
+  "limit": 10
 }
 ```
 
