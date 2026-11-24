@@ -183,16 +183,19 @@ def _like_contains(field: str, text: str) -> str:
 # fields, literals, comparisons, AND/OR/NOT, IN, BETWEEN, LIKE ... ESCAPE,
 # IS [NOT] NULL, DATE/TIMESTAMP literals and a few functions. Anything else
 # (subqueries, other tables, comments, statement separators) is rejected here.
+
+# Fields of the default baltegis layer, used if the layer's metadata cannot be read.
 PERMIT_FIELDS = {
     "CaseNumber", "Description", "ExpirationDate", "IssuedDate", "Address",
     "BLOCKLOT", "ExistingUse", "ProposedUse", "csm_projname", "prc_block_no",
     "prc_lot", "Neighborhood", "Cost", "Council_District", "OBJECTID",
     "HousingMarketTypology2017", "IsPermitModification", "PermitName",
 }
-_DATE_FIELDS = {"issueddate", "expirationdate"}
-_FIELDS_BY_LOWER = {f.lower(): f for f in PERMIT_FIELDS}
+_DEFAULT_DATE_FIELDS = {"IssuedDate", "ExpirationDate"}
 _WHERE_KEYWORDS = {"and", "or", "not", "in", "is", "null", "like", "between", "escape"}
 _WHERE_FUNCTIONS = {"upper", "lower"}
+# The service evaluates CURRENT_DATE as the UTC date, which is tomorrow in Baltimore
+# from 7 or 8 pm on. Both constants are replaced with Baltimore-time literals.
 _WHERE_CONSTANTS = {"current_date", "current_timestamp"}
 _WHERE_MAX_LENGTH = 1000
 _WHERE_TOKEN = re.compile(
@@ -204,8 +207,59 @@ _WHERE_TOKEN = re.compile(
 )
 
 
-def validate_where_clause(where: str) -> str:
-    """Return `where` unchanged if it fits the allowed grammar, else raise ValueError."""
+class LayerFields:
+    """Field names of the permit layer, looked up case-insensitively."""
+
+    def __init__(self, names, date_names):
+        self.by_lower = {n.lower(): n for n in names}
+        self.date_lower = {n.lower() for n in date_names}
+
+    def listing(self) -> str:
+        return ", ".join(sorted(self.by_lower.values(), key=str.lower))
+
+
+DEFAULT_LAYER_FIELDS = LayerFields(PERMIT_FIELDS, _DEFAULT_DATE_FIELDS)
+_layer_fields_cache: dict = {}
+
+
+async def get_layer_fields() -> LayerFields:
+    """Fields of the layer BALTIMORE_PERMIT_API points at, read once from its metadata.
+
+    This keeps count_permits correct when the endpoint is overridden (the ArcGIS
+    Online copy has OBJECTID_1 and GlobalID, for example). If the metadata cannot
+    be read, fall back to the default layer's fields without caching the failure.
+    """
+    url = BALTIMORE_PERMIT_API
+    if url in _layer_fields_cache:
+        return _layer_fields_cache[url]
+    layer_url = url[: -len("/query")] if url.rstrip("/").endswith("/query") else url
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(layer_url.rstrip("/"), params={"f": "json"})
+            response.raise_for_status()
+            meta = response.json()
+        fields = meta["fields"]
+        names = [f["name"] for f in fields if isinstance(f.get("name"), str)]
+        dates = [f["name"] for f in fields if f.get("type") == "esriFieldTypeDate"]
+        if not names:
+            raise ValueError("no fields")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return DEFAULT_LAYER_FIELDS
+    _layer_fields_cache[url] = LayerFields(names, dates)
+    return _layer_fields_cache[url]
+
+
+def validate_where_clause(
+    where: str,
+    fields: LayerFields = DEFAULT_LAYER_FIELDS,
+    now: Optional[datetime] = None,
+) -> str:
+    """Check `where` against the allowed grammar and return the clause to send.
+
+    Raises ValueError if it does not fit. The returned clause is `where` with
+    CURRENT_DATE and CURRENT_TIMESTAMP replaced by DATE/TIMESTAMP literals for
+    `now` in Baltimore time, so the result does not depend on the server's clock.
+    """
     if not isinstance(where, str) or not where.strip():
         raise ValueError("where_clause must be a non-empty string")
     if len(where) > _WHERE_MAX_LENGTH:
@@ -214,7 +268,7 @@ def validate_where_clause(where: str) -> str:
     if "--" in _WHERE_TOKEN.sub(lambda m: "''" if m.lastgroup == "string" else m.group(0), where):
         raise ValueError("where_clause may not contain SQL comments (--)")
 
-    tokens = []
+    tokens = []  # (kind, text, start, end)
     pos = 0
     while pos < len(where):
         m = _WHERE_TOKEN.match(where, pos)
@@ -223,13 +277,15 @@ def validate_where_clause(where: str) -> str:
                 f"where_clause has an unsupported character at position {pos}: {where[pos]!r}. "
                 "Use field names, 'quoted strings', numbers, comparisons and parentheses only."
             )
-        pos = m.end()
         if m.lastgroup:
-            tokens.append((m.lastgroup, m.group(m.lastgroup)))
+            tokens.append((m.lastgroup, m.group(m.lastgroup), m.start(), m.end()))
+        pos = m.end()
 
+    now = (now or datetime.now(CITY_TZ)).astimezone(CITY_TZ)
+    replacements = []  # (start, end, text)
     depth = 0
-    for i, (kind, text) in enumerate(tokens):
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else (None, None)
+    for i, (kind, text, start, end) in enumerate(tokens):
+        nxt = tokens[i + 1][:2] if i + 1 < len(tokens) else (None, None)
         if kind == "op":
             depth += text == "("
             depth -= text == ")"
@@ -239,10 +295,10 @@ def validate_where_clause(where: str) -> str:
         if kind != "word":
             continue
         word = text.lower()
-        if word in _FIELDS_BY_LOWER:
+        if word in fields.by_lower:
             # Epoch-millisecond date comparisons are rejected by the service; say how instead.
-            if word in _DATE_FIELDS and nxt[0] == "op" and nxt[1] in {"=", "<>", "!=", "<", "<=", ">", ">="}:
-                after = tokens[i + 2] if i + 2 < len(tokens) else (None, None)
+            if word in fields.date_lower and nxt[0] == "op" and nxt[1] in {"=", "<>", "!=", "<", "<=", ">", ">="}:
+                after = tokens[i + 2][:2] if i + 2 < len(tokens) else (None, None)
                 if after[0] == "number":
                     raise ValueError(
                         f"Compare {text} with a date literal, e.g. {text} >= DATE '2025-01-01' "
@@ -254,13 +310,20 @@ def validate_where_clause(where: str) -> str:
         elif word in _WHERE_FUNCTIONS:
             if nxt != ("op", "("):
                 raise ValueError(f"{text.upper()} must be followed by parentheses")
-        elif word not in _WHERE_KEYWORDS and word not in _WHERE_CONSTANTS:
+        elif word == "current_date":
+            replacements.append((start, end, f"DATE '{now:%Y-%m-%d}'"))
+        elif word == "current_timestamp":
+            replacements.append((start, end, f"TIMESTAMP '{now:%Y-%m-%d %H:%M:%S}'"))
+        elif word not in _WHERE_KEYWORDS:
             raise ValueError(
                 f"where_clause uses {text!r}, which is not a permit field or supported keyword. "
-                f"Fields: {', '.join(sorted(PERMIT_FIELDS, key=str.lower))}."
+                f"Fields: {fields.listing()}."
             )
     if depth != 0:
         raise ValueError("where_clause has unbalanced parentheses")
+
+    for start, end, text in reversed(replacements):
+        where = where[:start] + text + where[end:]
     return where
 
 
@@ -489,6 +552,17 @@ def _int_arg(arguments: dict, name: str, default: int, lo: int, hi: int) -> int:
     return value
 
 
+def _search_text_arg(arguments: dict, name: str) -> str:
+    """Read a required search string, raising (a tool error) if it is missing or blank.
+
+    A blank search would match every permit, which is never what was meant.
+    """
+    value = arguments.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty search string")
+    return value
+
+
 def _limit_schema(default: int = DEFAULT_LIMIT, hi: int = MAX_LIMIT) -> dict:
     return {
         "type": "integer",
@@ -531,6 +605,7 @@ async def _point_reaches_city(lat: float, lon: float, radius_m: int) -> Optional
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools for querying permit data."""
+    fields = await get_layer_fields()
     return [
         Tool(
             name="search_permits_by_address",
@@ -540,7 +615,8 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "address": {
                         "type": "string",
-                        "description": "Address or part of address to search for (e.g., '100 Main St' or 'Main')"
+                        "description": "Address or part of address to search for (e.g., '100 Main St' or 'Main')",
+                        "minLength": 1
                     },
                     "limit": _limit_schema()
                 },
@@ -574,7 +650,8 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "neighborhood": {
                         "type": "string",
-                        "description": "Neighborhood name (e.g., 'Fells Point', 'Canton')"
+                        "description": "Neighborhood name (e.g., 'Fells Point', 'Canton')",
+                        "minLength": 1
                     },
                     "limit": _limit_schema()
                 },
@@ -650,10 +727,10 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Count permits matching a WHERE clause. Useful for checking how many permits match "
                 "criteria before fetching details. The clause may use only the permit fields "
-                f"({', '.join(sorted(PERMIT_FIELDS, key=str.lower))}), 'quoted strings', numbers, "
+                f"({fields.listing()}), 'quoted strings', numbers, "
                 "= <> < <= > >=, AND/OR/NOT, IN, BETWEEN, LIKE (with optional ESCAPE), IS [NOT] NULL, "
-                "UPPER()/LOWER(), CURRENT_DATE, and DATE 'YYYY-MM-DD' or "
-                "TIMESTAMP 'YYYY-MM-DD HH:MM:SS' literals for dates."
+                "UPPER()/LOWER(), and DATE 'YYYY-MM-DD' or TIMESTAMP 'YYYY-MM-DD HH:MM:SS' literals "
+                "for dates, in Baltimore time. CURRENT_DATE and CURRENT_TIMESTAMP mean now in Baltimore."
             ),
             inputSchema={
                 "type": "object",
@@ -675,11 +752,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     """Handle tool calls."""
     
     if name == "search_permits_by_address":
-        address = arguments.get("address", "")
+        address = _search_text_arg(arguments, "address")
         limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
-        # Build WHERE clause - handle partial matches
-        where = _like_contains("Address", address) if address else "1=1"
+        where = _like_contains("Address", address)
 
         data = await query_permit_api_paginated(where_clause=where, max_records=limit)
 
@@ -701,14 +777,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         # Validate dates; strptime also guarantees only digits reach the query.
+        # Raised, so the client sees a tool error rather than an ordinary reply.
         try:
             start = datetime.strptime(start_date, "%Y-%m-%d")
             end = datetime.strptime(end_date, "%Y-%m-%d")
-        except ValueError as e:
-            return [TextContent(
-                type="text",
-                text=f"Invalid date format. Please use YYYY-MM-DD format. Error: {str(e)}"
-            )]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid date: use YYYY-MM-DD for start_date and end_date ({e})")
+        if start > end:
+            raise ValueError(f"start_date {start_date} is after end_date {end_date}")
 
         # ArcGIS standardized SQL date literals; the service rejects epoch-ms
         # comparisons. The end date is inclusive (through 23:59:59).
@@ -732,7 +808,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return [TextContent(type="text", text=result_text)]
 
     elif name == "search_permits_by_neighborhood":
-        neighborhood = arguments.get("neighborhood", "")
+        neighborhood = _search_text_arg(arguments, "neighborhood")
         limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         where = _like_contains("Neighborhood", neighborhood)
@@ -875,7 +951,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     
     elif name == "count_permits":
         # Raises (a tool error) unless the clause fits the allowed grammar.
-        where_clause = validate_where_clause(arguments.get("where_clause", "1=1"))
+        where_clause = validate_where_clause(arguments.get("where_clause", "1=1"), await get_layer_fields())
 
         data = await query_permit_api(where_clause=where_clause, return_count_only=True)
 

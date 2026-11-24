@@ -91,7 +91,7 @@ Replace `/path/to/balt-permit-mcp-server` with the actual absolute path to this 
 Search for permits by address or address pattern.
 
 **Parameters:**
-- `address` (required): Address or part of address to search (e.g., "100 Main St" or "Main"). Matching is case-insensitive and literal: `%`, `_` and `[` match only themselves.
+- `address` (required): Address or part of address to search (e.g., "100 Main St" or "Main"). Matching is case-insensitive and literal: `%`, `_` and `[` match only themselves. A blank address is an error.
 - `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
@@ -109,6 +109,8 @@ Search for permits issued within a date range.
 **Parameters:**
 - `start_date` (required): Start date in YYYY-MM-DD format
 - `end_date` (required): End date in YYYY-MM-DD format. The end date is included.
+
+An invalid date, or a start date after the end date, is a tool error.
 - `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
@@ -127,7 +129,7 @@ Dates are calendar days in Baltimore time. Results are not sorted, so when more 
 Search for permits in a specific neighborhood.
 
 **Parameters:**
-- `neighborhood` (required): Neighborhood name or part of one (e.g., "Fells Point", "Canton"). Matching is case-insensitive and literal, as for addresses.
+- `neighborhood` (required): Neighborhood name or part of one (e.g., "Fells Point", "Canton"). Matching is case-insensitive and literal, as for addresses. A blank neighborhood is an error.
 - `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
@@ -198,11 +200,11 @@ Get the most recently issued permits, newest first. Sorting is done by the servi
 
 Count permits matching a SQL WHERE clause. The server checks the clause before sending it and returns an error unless it uses only:
 
-- the permit fields listed under [Permit Data Fields](#permit-data-fields) (plus `OBJECTID`, `PermitName`, `csm_projname`, `prc_block_no`, `prc_lot` and `HousingMarketTypology2017`), case-insensitive
+- the permit layer's fields, case-insensitive. They are read from the layer's metadata, so an endpoint set with `BALTIMORE_PERMIT_API` uses its own fields; the tool description lists them. For the default layer that is the fields under [Permit Data Fields](#permit-data-fields) plus `OBJECTID`, `PermitName`, `csm_projname`, `prc_block_no`, `prc_lot` and `HousingMarketTypology2017`. If the metadata can't be read, that default list is used.
 - `'quoted strings'` (double a quote to include one) and numbers
 - `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `+`, `-` and parentheses
 - `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE` (with optional `ESCAPE`) and `IS [NOT] NULL`
-- `UPPER()`, `LOWER()`, `CURRENT_DATE` and `CURRENT_TIMESTAMP`
+- `UPPER()`, `LOWER()`, `CURRENT_DATE` and `CURRENT_TIMESTAMP`. The last two are replaced with today's date and the current time in Baltimore before the clause is sent, because the service evaluates `CURRENT_DATE` in UTC (tomorrow, in Baltimore, from 7 or 8 pm). The reply shows the clause as sent.
 - `DATE 'YYYY-MM-DD'` or `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` for dates; numeric timestamps are rejected with a hint, since the service does not accept them
 
 Subqueries, other tables, comments, semicolons and clauses over 1,000 characters are rejected.
