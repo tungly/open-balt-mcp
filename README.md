@@ -10,7 +10,7 @@ This MCP server provides tools to query Baltimore's building permit database:
 - **Search by Date Range**: Get permits issued within a date range
 - **Search by Neighborhood**: Find all permits in a specific neighborhood
 - **Search by Case Number**: Look up a specific permit by its case number
-- **Recent Permits**: Get the most recently issued permits
+- **Recent Permits**: Get the most recently issued permits, newest first
 - **Count Permits**: Count permits matching specific criteria
 - **Search Near a Point**: Find permits within a radius of a lat/lon, most recent first, with distances
 
@@ -28,7 +28,10 @@ This MCP server provides tools to query Baltimore's building permit database:
 
 ## Configuration
 
-No configuration is required. The server connects directly to Baltimore's public API endpoint.
+No configuration is required. The server connects directly to Baltimore's public API endpoint. Two optional environment variables override the services it uses, in case the city moves them again:
+
+- `BALTIMORE_PERMIT_API`: the permit layer's query URL (default: the baltegis endpoint under [Data Source](#data-source)). `test_server.py` reads the same variable, so the tests check the endpoint the server will use.
+- `BALTIMORE_BOUNDARY_LAYER`: the city boundary layer `search_permits_near` checks points against (default: the council-district layer at `https://baltegis.baltimorecity.gov/mapping/rest/services/Planning/Boundaries/MapServer/4/query`).
 
 ## Usage
 
@@ -52,6 +55,12 @@ Run the comprehensive test suite:
 
 ```bash
 python3.11 test_comprehensive.py
+```
+
+Or the quick live check against the permit API, which prints the endpoint it tests and fails if the API returns an error or no recent permits:
+
+```bash
+python3.11 test_server.py
 ```
 
 ### MCP Client Configuration
@@ -82,8 +91,8 @@ Replace `/path/to/balt-permit-mcp-server` with the actual absolute path to this 
 Search for permits by address or address pattern.
 
 **Parameters:**
-- `address` (required): Address or part of address to search (e.g., "100 Main St" or "Main")
-- `limit` (optional): Maximum results to return (default: 50, max: 1000)
+- `address` (required): Address or part of address to search (e.g., "100 Main St" or "Main"). Matching is case-insensitive and literal: `%`, `_` and `[` match only themselves.
+- `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
 ```json
@@ -99,8 +108,8 @@ Search for permits issued within a date range.
 
 **Parameters:**
 - `start_date` (required): Start date in YYYY-MM-DD format
-- `end_date` (required): End date in YYYY-MM-DD format
-- `limit` (optional): Maximum results to return (default: 50, max: 1000)
+- `end_date` (required): End date in YYYY-MM-DD format. The end date is included.
+- `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
 ```json
@@ -111,13 +120,15 @@ Search for permits issued within a date range.
 }
 ```
 
+Dates are calendar days in Baltimore time. Results are not sorted, so when more permits match than `limit`, which ones are returned is up to the service; use `get_recent_permits` for the newest.
+
 ### `search_permits_by_neighborhood`
 
 Search for permits in a specific neighborhood.
 
 **Parameters:**
-- `neighborhood` (required): Neighborhood name (e.g., "Fells Point", "Canton")
-- `limit` (optional): Maximum results to return (default: 50, max: 1000)
+- `neighborhood` (required): Neighborhood name or part of one (e.g., "Fells Point", "Canton"). Matching is case-insensitive and literal, as for addresses.
+- `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
 
 **Example:**
 ```json
@@ -136,10 +147,12 @@ Find permits within a radius of a point, most recently issued first. Each result
 **Parameters:**
 - `lat` (required): Latitude, WGS84 decimal degrees (e.g., 39.2763)
 - `lon` (required): Longitude, WGS84 decimal degrees (e.g., -76.5688)
-- `radius_m` (optional): Search radius in meters (default: 250, max: 2000)
-- `limit` (optional): Maximum results to return (default: 25, max: 200)
+- `radius_m` (optional): Search radius in meters (default: 250, min: 1, max: 2000)
+- `limit` (optional): Maximum results to return (default: 25, min: 1, max: 200)
 
-Points outside Baltimore City return an error rather than an empty result, so a wrong coordinate is not mistaken for "no permits here."
+Points outside Baltimore City return an error rather than an empty result, so a wrong coordinate is not mistaken for "no permits here." The server checks the point against the city's boundary (its council districts): a point is accepted if the search circle reaches city land, so a point in the harbor near the shore still works, while points in Towson, Brooklyn Park or Dundalk are rejected. If the boundary service is unavailable, a rectangle around the city limits is used instead.
+
+Out-of-range `radius_m` or `limit` values are errors; they are not silently clamped. Results are deduplicated and ordered by issue date on the server. When the text says the result limit was reached, there may be more permits in the radius; narrow it to see older ones.
 
 **Example:**
 ```json
@@ -167,11 +180,11 @@ Get a specific permit by its case number.
 
 ### `get_recent_permits`
 
-Get recently issued permits.
+Get the most recently issued permits, newest first. Sorting is done by the service, so these are the newest permits in the window, not a sorted sample.
 
 **Parameters:**
-- `limit` (optional): Maximum results to return (default: 50, max: 1000)
-- `days` (optional): Number of days to look back (default: 30)
+- `limit` (optional): Maximum results to return (default: 50, min: 1, max: 2000)
+- `days` (optional): Number of days to look back, counting from midnight today in Baltimore (default: 30, min: 1, max: 3650)
 
 **Example:**
 ```json
@@ -183,7 +196,7 @@ Get recently issued permits.
 
 ### `count_permits`
 
-Count permits matching a SQL WHERE clause.
+Count permits matching a SQL WHERE clause. The clause is passed to the service as written; date comparisons need `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` or `DATE 'YYYY-MM-DD'` literals, since the service rejects millisecond timestamps.
 
 **Parameters:**
 - `where_clause` (required): SQL WHERE clause for filtering
@@ -210,8 +223,8 @@ Each permit includes the following information:
 - **CaseNumber**: Unique permit case number
 - **Address**: Property address
 - **Neighborhood**: Neighborhood name
-- **IssuedDate**: Date permit was issued
-- **ExpirationDate**: Date permit expires
+- **IssuedDate**: Date permit was issued (shown as YYYY-MM-DD in Baltimore time)
+- **ExpirationDate**: Date permit expires (shown as YYYY-MM-DD in Baltimore time)
 - **Cost**: Estimated project cost
 - **Description**: Detailed work description
 - **BLOCKLOT**: Block and lot number
@@ -227,15 +240,13 @@ This MCP server is provided as-is. The data source is Baltimore City's open data
 
 ## Notes
 
-- The API may return results with `exceededTransferLimit: true` when there are many matching permits. In such cases, results may be truncated.
-- Date queries use timestamp comparisons (milliseconds since epoch) based on the API's internal format.
-- Address and neighborhood searches are case-insensitive and support partial matches.
+- Results are paged automatically up to `limit`, using the service's "more records" flag wherever it appears (ArcGIS Online reports it only under `properties`).
+- When the service rejects a query, the tool returns an error with the service's message instead of reporting "No permits found."
+- The service stores dates as midnight in Baltimore time (America/New_York) and reads date literals in that zone. The server converts dates in that zone too, so output is the same whatever time zone the server runs in.
+- Address and neighborhood searches are case-insensitive partial matches, and wildcard characters in the search text are matched literally.
 
 ## Support
 
 For issues or questions about this MCP server, please open an issue in the repository.
 
 For questions about the underlying data, contact Baltimore City's open data team.
-=======
-# open-balt-mcp
-MCP for accessing Baltimore's open data

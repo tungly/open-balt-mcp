@@ -4,7 +4,21 @@ Comprehensive test suite for Baltimore Permit MCP Server
 """
 
 import asyncio
-from server import app, call_tool, list_tools
+from server import app, call_tool as _call_tool, list_tools
+
+
+async def call_tool(name, arguments):
+    """Call a tool handler and return its content blocks.
+
+    Tools with an outputSchema return (content, structured_content); the
+    others return content alone.
+    """
+    result = await _call_tool(name, arguments)
+    if isinstance(result, tuple):
+        content, structured = result
+        assert isinstance(structured, dict), f"{name} returned no structured content"
+        return content
+    return result
 
 
 async def test_list_tools():
@@ -19,7 +33,8 @@ async def test_list_tools():
         'search_permits_by_neighborhood',
         'search_permits_by_case_number',
         'get_recent_permits',
-        'count_permits'
+        'count_permits',
+        'search_permits_near'
     ]
 
     tool_names = [t.name for t in tools]
