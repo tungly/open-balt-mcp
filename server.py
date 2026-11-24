@@ -157,6 +157,25 @@ async def query_permit_api_paginated(
     }
 
 
+# Characters LIKE treats as wildcards on this service (SQL Server backed, so "["
+# opens a character set), plus the escape character itself.
+_LIKE_ESCAPE = "!"
+_LIKE_SPECIAL = (_LIKE_ESCAPE, "%", "_", "[")
+
+
+def _like_contains(field: str, text: str) -> str:
+    """WHERE clause matching `field` containing `text` literally.
+
+    Wildcards in the user's text are escaped, so "100%" or "A_B" match those
+    characters instead of anything; quotes are doubled so the text stays one
+    string literal. Checked on baltegis and on ArcGIS Online.
+    """
+    for ch in _LIKE_SPECIAL:  # the escape character must go first
+        text = text.replace(ch, _LIKE_ESCAPE + ch)
+    text = text.replace("'", "''")
+    return f"{field} LIKE '%{text}%' ESCAPE '{_LIKE_ESCAPE}'"
+
+
 def format_permit(permit: dict) -> str:
     """Format a permit feature into a readable string."""
     props = permit.get("properties") or {}
@@ -564,8 +583,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
         # Build WHERE clause - handle partial matches
-        escaped_address = address.replace("'", "''") if address else ""
-        where = f"Address LIKE '%{escaped_address}%'" if address else "1=1"
+        where = _like_contains("Address", address) if address else "1=1"
 
         data = await query_permit_api_paginated(where_clause=where, max_records=limit)
 
@@ -621,8 +639,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         neighborhood = arguments.get("neighborhood", "")
         limit = _int_arg(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
 
-        escaped_neighborhood = neighborhood.replace("'", "''")
-        where = f"Neighborhood LIKE '%{escaped_neighborhood}%'"
+        where = _like_contains("Neighborhood", neighborhood)
 
         data = await query_permit_api_paginated(where_clause=where, max_records=limit)
         features = data.get("features") or []

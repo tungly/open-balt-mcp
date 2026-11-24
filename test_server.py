@@ -5,6 +5,7 @@ Tests the API connection and server logic
 """
 
 import asyncio
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -14,8 +15,12 @@ except ImportError:
     print("ERROR: httpx not installed. Please run: pip install -r requirements.txt")
     sys.exit(1)
 
-# Baltimore Open Data API endpoint
-BALTIMORE_PERMIT_API = "https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query"
+# Baltimore Open Data API endpoint. Same default and BALTIMORE_PERMIT_API override as server.py, so the tests
+# check the endpoint the server will actually use.
+BALTIMORE_PERMIT_API = os.environ.get(
+    "BALTIMORE_PERMIT_API",
+    "https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query",
+)
 
 
 async def test_api_connection():
@@ -163,6 +168,7 @@ async def main():
     """Run all tests."""
     print("=" * 60)
     print("Baltimore Permit MCP Server - Test Suite")
+    print(f"Endpoint: {BALTIMORE_PERMIT_API}")
     print("=" * 60)
     
     results = []
