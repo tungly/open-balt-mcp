@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server import Server
@@ -29,6 +30,9 @@ BALTIMORE_PERMIT_API = os.environ.get(
     "BALTIMORE_PERMIT_API",
     "https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query",
 )
+
+# The permit service stores and compares dates in Baltimore's local time.
+CITY_TZ = ZoneInfo("America/New_York")
 
 app = Server("balt-permit-mcp-server")
 
@@ -158,23 +162,10 @@ def format_permit(permit: dict) -> str:
     props = permit.get("properties") or {}
     geom = permit.get("geometry") or {}  # GeoJSON allows "geometry": null
     
-    # Format dates
-    issued_date = ""
-    if props.get("IssuedDate"):
-        try:
-            issued_ts = props["IssuedDate"] / 1000  # Convert from milliseconds
-            issued_date = datetime.fromtimestamp(issued_ts).strftime("%Y-%m-%d")
-        except (ValueError, TypeError, OSError):
-            issued_date = str(props.get("IssuedDate", "N/A"))
-    
-    expiration_date = ""
-    if props.get("ExpirationDate"):
-        try:
-            exp_ts = props["ExpirationDate"] / 1000
-            expiration_date = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d")
-        except (ValueError, TypeError, OSError):
-            expiration_date = str(props.get("ExpirationDate", "N/A"))
-    
+    # Dates are converted in the city's time zone, not the host's (see _ms_to_date).
+    issued_date = _ms_to_date(props.get("IssuedDate")) or ""
+    expiration_date = _ms_to_date(props.get("ExpirationDate")) or ""
+
     # Format coordinates
     coords = ""
     if geom.get("coordinates"):
@@ -191,7 +182,7 @@ def format_permit(permit: dict) -> str:
     Issued: {issued_date}
     Expires: {expiration_date}
     Cost: {cost_str}
-    Description: {props.get('Description', 'N/A')[:200]}...
+    Description: {(props.get('Description') or 'N/A')[:200]}...
     Block/Lot: {props.get('BLOCKLOT', 'N/A')}
     Council District: {props.get('Council_District', 'N/A')}
     Existing Use: {props.get('ExistingUse', 'N/A')}
@@ -202,11 +193,15 @@ def format_permit(permit: dict) -> str:
 
 
 def _ms_to_date(value: Any) -> Optional[str]:
-    """Convert an ArcGIS epoch-milliseconds timestamp to YYYY-MM-DD, or None."""
+    """Convert an ArcGIS epoch-milliseconds timestamp to a YYYY-MM-DD date in Baltimore, or None.
+
+    The service stores dates as midnight America/New_York (its dateFieldsTimeReference),
+    so converting in the host's zone would show the previous day on any host west of Eastern.
+    """
     if value is None:
         return None
     try:
-        return datetime.fromtimestamp(value / 1000).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(value / 1000, tz=CITY_TZ).strftime("%Y-%m-%d")
     except (ValueError, TypeError, OSError):
         return None
 
@@ -678,7 +673,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         days = arguments.get("days", 30)
 
         # Calculate date threshold
-        cutoff_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=int(days))
+        # "Today" in Baltimore; the service reads TIMESTAMP literals as America/New_York.
+        cutoff_date = datetime.now(CITY_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=int(days))
 
         where = f"IssuedDate >= TIMESTAMP '{cutoff_date:%Y-%m-%d %H:%M:%S}'"
 
