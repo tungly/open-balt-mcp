@@ -1,6 +1,6 @@
 # Baltimore Permit MCP Server
 
-An MCP (Model Context Protocol) server that provides access to Baltimore City's housing and building permit data from the [Baltimore Open Data Portal](https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3).
+An MCP (Model Context Protocol) server that provides access to Baltimore City's housing and building permit data from the [Baltimore Open Data Portal](https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3).
 
 ## Features
 
@@ -174,7 +174,7 @@ Count permits matching a SQL WHERE clause.
 
 This server connects to Baltimore City's ArcGIS FeatureServer:
 
-- **Endpoint**: `https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3`
+- **Endpoint**: `https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3`
 - **Format**: GeoJSON
 - **Data**: Building Permits from the Department of Housing & Community Development (DHCD)
 

@@ -15,7 +15,7 @@ except ImportError:
     sys.exit(1)
 
 # Baltimore Open Data API endpoint
-BALTIMORE_PERMIT_API = "https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query"
+BALTIMORE_PERMIT_API = "https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query"
 
 
 async def test_api_connection():

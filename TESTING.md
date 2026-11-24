@@ -54,7 +54,7 @@
 ## Manual API Test
 You can manually test the Baltimore API endpoint in a browser:
 ```
-https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query?outFields=CaseNumber,Address&where=1=1&f=geojson&resultRecordCount=5
+https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query?outFields=CaseNumber,Address&where=1=1&f=geojson&resultRecordCount=5
 ```
 
 This should return a GeoJSON response with permit data.

@@ -7,7 +7,7 @@ Connects to data.baltimorecity.gov to query building permits
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
 from urllib.parse import quote, urlencode
 
@@ -22,8 +22,12 @@ from mcp.types import (
 )
 
 
-# Baltimore Open Data API endpoint
-BALTIMORE_PERMIT_API = "https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query"
+# Baltimore Open Data API endpoint. Override with BALTIMORE_PERMIT_API if the
+# city moves the service again (it was previously on egisdata.baltimorecity.gov/egis).
+BALTIMORE_PERMIT_API = os.environ.get(
+    "BALTIMORE_PERMIT_API",
+    "https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3/query",
+)
 
 app = Server("balt-permit-mcp-server")
 
@@ -56,9 +60,20 @@ async def query_permit_api(
         try:
             response = await client.get(BALTIMORE_PERMIT_API, params=params)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
         except httpx.HTTPError as e:
             raise Exception(f"Failed to fetch permit data: {str(e)}")
+
+    # ArcGIS reports query errors as HTTP 200 with an "error" body. Without this
+    # check a rejected query has no "features" and reads as "No permits found".
+    if isinstance(data, dict) and "error" in data:
+        err = data["error"] or {}
+        details = "; ".join(err.get("details") or [])
+        raise Exception(
+            f"Permit API rejected the query ({err.get('code')}): {err.get('message')}"
+            + (f" {details}" if details else "")
+        )
+    return data
 
 
 async def query_permit_api_paginated(
@@ -383,17 +398,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         end_date = arguments.get("end_date", "")
         limit = arguments.get("limit", 50)
 
-        # Convert dates to timestamps (milliseconds since epoch)
+        # Validate dates; strptime also guarantees only digits reach the query.
         try:
-            start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
-            end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp() * 1000)
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
         except ValueError as e:
             return [TextContent(
                 type="text",
                 text=f"Invalid date format. Please use YYYY-MM-DD format. Error: {str(e)}"
             )]
 
-        where = f"IssuedDate >= {start_ts} AND IssuedDate <= {end_ts}"
+        # ArcGIS standardized SQL date literals; the service rejects epoch-ms
+        # comparisons. The end date is inclusive (through 23:59:59).
+        where = (
+            f"IssuedDate >= TIMESTAMP '{start:%Y-%m-%d} 00:00:00' "
+            f"AND IssuedDate <= TIMESTAMP '{end:%Y-%m-%d} 23:59:59'"
+        )
 
         data = await query_permit_api_paginated(where_clause=where, max_records=limit)
         
@@ -460,10 +480,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         days = arguments.get("days", 30)
 
         # Calculate date threshold
-        cutoff_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff_ts = int((cutoff_date.timestamp() - (days * 24 * 60 * 60)) * 1000)
+        cutoff_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=int(days))
 
-        where = f"IssuedDate >= {cutoff_ts}"
+        where = f"IssuedDate >= TIMESTAMP '{cutoff_date:%Y-%m-%d %H:%M:%S}'"
 
         # Get more records to sort properly (fetch 2x the limit, then sort)
         data = await query_permit_api_paginated(where_clause=where, max_records=limit * 2)

@@ -1,7 +1,7 @@
 # Baltimore City Building Permits Dataset Metadata
 
 **Source:** Baltimore City Department of Housing & Community Development (DHCD)
-**API Endpoint:** `https://egisdata.baltimorecity.gov/egis/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3`
+**API Endpoint:** `https://baltegis.baltimorecity.gov/mapping/rest/services/Housing/DHCD_Open_Baltimore_Datasets/FeatureServer/3`
 **Total Records:** ~272,887 (as of February 2026)
 **Date Range:** 2019–present (no data prior to 2019)
 
