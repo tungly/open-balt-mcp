@@ -8,6 +8,7 @@ import asyncio
 import json
 import math
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
 from urllib.parse import quote, urlencode
@@ -174,6 +175,93 @@ def _like_contains(field: str, text: str) -> str:
         text = text.replace(ch, _LIKE_ESCAPE + ch)
     text = text.replace("'", "''")
     return f"{field} LIKE '%{text}%' ESCAPE '{_LIKE_ESCAPE}'"
+
+
+# --- count_permits WHERE validation --------------------------------------
+# count_permits takes a WHERE clause from the model. Rather than send arbitrary
+# SQL to the city's server, accept only a small grammar: the permit layer's
+# fields, literals, comparisons, AND/OR/NOT, IN, BETWEEN, LIKE ... ESCAPE,
+# IS [NOT] NULL, DATE/TIMESTAMP literals and a few functions. Anything else
+# (subqueries, other tables, comments, statement separators) is rejected here.
+PERMIT_FIELDS = {
+    "CaseNumber", "Description", "ExpirationDate", "IssuedDate", "Address",
+    "BLOCKLOT", "ExistingUse", "ProposedUse", "csm_projname", "prc_block_no",
+    "prc_lot", "Neighborhood", "Cost", "Council_District", "OBJECTID",
+    "HousingMarketTypology2017", "IsPermitModification", "PermitName",
+}
+_DATE_FIELDS = {"issueddate", "expirationdate"}
+_FIELDS_BY_LOWER = {f.lower(): f for f in PERMIT_FIELDS}
+_WHERE_KEYWORDS = {"and", "or", "not", "in", "is", "null", "like", "between", "escape"}
+_WHERE_FUNCTIONS = {"upper", "lower"}
+_WHERE_CONSTANTS = {"current_date", "current_timestamp"}
+_WHERE_MAX_LENGTH = 1000
+_WHERE_TOKEN = re.compile(
+    r"\s+"
+    r"|(?P<string>'(?:[^']|'')*')"
+    r"|(?P<number>-?\d+(?:\.\d+)?)"
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<op><>|!=|<=|>=|=|<|>|\(|\)|,|\+|-)"
+)
+
+
+def validate_where_clause(where: str) -> str:
+    """Return `where` unchanged if it fits the allowed grammar, else raise ValueError."""
+    if not isinstance(where, str) or not where.strip():
+        raise ValueError("where_clause must be a non-empty string")
+    if len(where) > _WHERE_MAX_LENGTH:
+        raise ValueError(f"where_clause is longer than {_WHERE_MAX_LENGTH} characters")
+    # Comments outside string literals would let the rest of the clause be ignored.
+    if "--" in _WHERE_TOKEN.sub(lambda m: "''" if m.lastgroup == "string" else m.group(0), where):
+        raise ValueError("where_clause may not contain SQL comments (--)")
+
+    tokens = []
+    pos = 0
+    while pos < len(where):
+        m = _WHERE_TOKEN.match(where, pos)
+        if not m:
+            raise ValueError(
+                f"where_clause has an unsupported character at position {pos}: {where[pos]!r}. "
+                "Use field names, 'quoted strings', numbers, comparisons and parentheses only."
+            )
+        pos = m.end()
+        if m.lastgroup:
+            tokens.append((m.lastgroup, m.group(m.lastgroup)))
+
+    depth = 0
+    for i, (kind, text) in enumerate(tokens):
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else (None, None)
+        if kind == "op":
+            depth += text == "("
+            depth -= text == ")"
+            if depth < 0:
+                raise ValueError("where_clause has unbalanced parentheses")
+            continue
+        if kind != "word":
+            continue
+        word = text.lower()
+        if word in _FIELDS_BY_LOWER:
+            # Epoch-millisecond date comparisons are rejected by the service; say how instead.
+            if word in _DATE_FIELDS and nxt[0] == "op" and nxt[1] in {"=", "<>", "!=", "<", "<=", ">", ">="}:
+                after = tokens[i + 2] if i + 2 < len(tokens) else (None, None)
+                if after[0] == "number":
+                    raise ValueError(
+                        f"Compare {text} with a date literal, e.g. {text} >= DATE '2025-01-01' "
+                        f"or {text} >= TIMESTAMP '2025-01-01 00:00:00'; numeric timestamps are not supported."
+                    )
+        elif word in ("date", "timestamp"):
+            if nxt[0] != "string":
+                raise ValueError(f"{text.upper()} must be followed by a quoted literal, e.g. DATE '2025-01-01'")
+        elif word in _WHERE_FUNCTIONS:
+            if nxt != ("op", "("):
+                raise ValueError(f"{text.upper()} must be followed by parentheses")
+        elif word not in _WHERE_KEYWORDS and word not in _WHERE_CONSTANTS:
+            raise ValueError(
+                f"where_clause uses {text!r}, which is not a permit field or supported keyword. "
+                f"Fields: {', '.join(sorted(PERMIT_FIELDS, key=str.lower))}."
+            )
+    if depth != 0:
+        raise ValueError("where_clause has unbalanced parentheses")
+    return where
 
 
 def format_permit(permit: dict) -> str:
@@ -559,13 +647,21 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="count_permits",
-            description="Count permits matching a query. Useful for checking how many permits match criteria before fetching details.",
+            description=(
+                "Count permits matching a WHERE clause. Useful for checking how many permits match "
+                "criteria before fetching details. The clause may use only the permit fields "
+                f"({', '.join(sorted(PERMIT_FIELDS, key=str.lower))}), 'quoted strings', numbers, "
+                "= <> < <= > >=, AND/OR/NOT, IN, BETWEEN, LIKE (with optional ESCAPE), IS [NOT] NULL, "
+                "UPPER()/LOWER(), CURRENT_DATE, and DATE 'YYYY-MM-DD' or "
+                "TIMESTAMP 'YYYY-MM-DD HH:MM:SS' literals for dates."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "where_clause": {
                         "type": "string",
-                        "description": "SQL WHERE clause for filtering (e.g., \"Address LIKE '%Main%'\", \"Council_District = 1\")"
+                        "description": "WHERE clause, e.g. \"Address LIKE '%Main%'\", \"Council_District = 1 AND Cost > 10000\", \"IssuedDate >= DATE '2025-01-01'\"",
+                        "maxLength": _WHERE_MAX_LENGTH
                     }
                 },
                 "required": ["where_clause"]
@@ -778,12 +874,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return [TextContent(type="text", text=result_text)]
     
     elif name == "count_permits":
-        where_clause = arguments.get("where_clause", "1=1")
-        
+        # Raises (a tool error) unless the clause fits the allowed grammar.
+        where_clause = validate_where_clause(arguments.get("where_clause", "1=1"))
+
         data = await query_permit_api(where_clause=where_clause, return_count_only=True)
-        
-        count = data.get("properties", {}).get("count", 0) if "properties" in data else data.get("count", 0)
-        
+
+        # f=geojson puts the count under "properties"; f=json at the top level.
+        count = (data.get("properties") or {}).get("count", data.get("count"))
+        if not isinstance(count, int):
+            raise Exception("Permit API returned no count for the query")
+
         return [TextContent(
             type="text",
             text=f"Found {count} permit(s) matching the query: {where_clause}"

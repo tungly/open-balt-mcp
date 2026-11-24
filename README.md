@@ -196,7 +196,16 @@ Get the most recently issued permits, newest first. Sorting is done by the servi
 
 ### `count_permits`
 
-Count permits matching a SQL WHERE clause. The clause is passed to the service as written; date comparisons need `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` or `DATE 'YYYY-MM-DD'` literals, since the service rejects millisecond timestamps.
+Count permits matching a SQL WHERE clause. The server checks the clause before sending it and returns an error unless it uses only:
+
+- the permit fields listed under [Permit Data Fields](#permit-data-fields) (plus `OBJECTID`, `PermitName`, `csm_projname`, `prc_block_no`, `prc_lot` and `HousingMarketTypology2017`), case-insensitive
+- `'quoted strings'` (double a quote to include one) and numbers
+- `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `+`, `-` and parentheses
+- `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE` (with optional `ESCAPE`) and `IS [NOT] NULL`
+- `UPPER()`, `LOWER()`, `CURRENT_DATE` and `CURRENT_TIMESTAMP`
+- `DATE 'YYYY-MM-DD'` or `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` for dates; numeric timestamps are rejected with a hint, since the service does not accept them
+
+Subqueries, other tables, comments, semicolons and clauses over 1,000 characters are rejected.
 
 **Parameters:**
 - `where_clause` (required): SQL WHERE clause for filtering
