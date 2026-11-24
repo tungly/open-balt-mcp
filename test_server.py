@@ -78,13 +78,16 @@ async def test_date_range_search():
     end_date = datetime.now()
     start_date = end_date - timedelta(days=365)  # Last year to get results
     
-    start_ts = int(start_date.timestamp() * 1000)
-    end_ts = int(end_date.timestamp() * 1000)
-    
+    # TIMESTAMP literals: the service rejects epoch-millisecond comparisons.
+    where = (
+        f"IssuedDate >= TIMESTAMP '{start_date:%Y-%m-%d} 00:00:00' "
+        f"AND IssuedDate <= TIMESTAMP '{end_date:%Y-%m-%d} 23:59:59'"
+    )
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             params = {
-                "where": f"IssuedDate >= {start_ts} AND IssuedDate <= {end_ts}",
+                "where": where,
                 "outFields": "CaseNumber,IssuedDate",
                 "f": "geojson",
                 "resultRecordCount": 3,
@@ -93,8 +96,16 @@ async def test_date_range_search():
             response = await client.get(BALTIMORE_PERMIT_API, params=params)
             response.raise_for_status()
             data = response.json()
-            
+
+            # ArcGIS returns query errors as HTTP 200 with an "error" body.
+            if "error" in data:
+                print(f"✗ Date range search rejected by API: {data['error']}")
+                return False
+
             count = len(data.get("features", []))
+            if count == 0:
+                print("✗ Date range search returned no permits for the last year")
+                return False
             print(f"✓ Date range search successful! Found {count} permits in date range")
             return True
         except Exception as e:
